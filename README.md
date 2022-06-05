@@ -19,9 +19,13 @@ blocknativeKey：https://www.blocknative.com/  创建个账号，个人中心获
 
 barkKey：IOS的bark软件推送key，用于推送mint成功或者失败信息（没有可以空着）
 
+scanApikey：https://etherscan.io/register 区块浏览器注册获取
+
 maxGasPrice：最大的GAS，超过不会跟
 
 maxGasLimit：最大的GAS消耗，超过不会跟
+
+maxValue: 最大金额（设置0就只跟免费的，0.1就表示收费0.1以下的也跟）
 
 follow：需要跟随的狗王地址，"follow": {"狗王地址":{"start": 开始跟单时间, "end": 结束跟单时间}}
 
@@ -29,6 +33,8 @@ blacklist：土狗名字黑名单，含有这些词的屏蔽
 
 # 已打包的exe
 自行打包或者找朋友帮忙pyinstaller打包吧
+
+实在要用exe的进discord下载吧
 
 监控开始，又闪退的，是网络连不上blocknative，不行就用香港VPS跑，
 
