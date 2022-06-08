@@ -3,15 +3,18 @@ import platform
 import threading
 import time
 import requests
-from blocknative.stream import Stream
 from web3 import Web3
 from eth_abi import decode_abi
 import os
+import asyncio
+from datetime import datetime
+import websockets
 
 configExample = {
     "RPC": "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
     "privateKey": ["私钥1", "私钥2"],
     "blocknativeKey": "监控平台key",
+    "alchemyKey": "",
     "barkKey": "IOS推送软件key",
     "scanApikey": "https://etherscan.io/register注册获取",
     "maxGasPrice": 50,
@@ -22,7 +25,7 @@ configExample = {
         "0x555555B63d1C3A8c09FB109d2c80464685Ee042B": {"start": 18, "end": 6},
         "0x99999983c70de9543cdc11dB5DE66A457d241e8B": {"start": 8, "end": 20}
     },
-    "blacklist": ["Ape", "Bear", "Duck", "Pixel", "Not", "Okay", "Woman", "Baby", "Goblin", "Ai"]
+    "blacklist": ["Ape", "Pixel", "Not", "Okay", "Woman", "Baby", "Goblin", "Ai"]
 }
 
 if platform.system().lower() == 'windows':
@@ -147,25 +150,30 @@ def isBlackList(_to):
 
 
 def isMintTime(_from):
-    for _follow in follows:
-        if _follow.lower() == _from.lower():
-            starttime = int(follows[_follow]['start'])
-            endtime = int(follows[_follow]['end'])
-            tm_hour = time.localtime().tm_hour
-            if tm_hour >= starttime or tm_hour < endtime:
+    if _from.lower() in follows:
+        starttime = int(follows[_from.lower()]['start'])
+        endtime = int(follows[_from.lower()]['end'])
+        tm_hour = time.localtime().tm_hour
+        if starttime < endtime:
+            if starttime <= tm_hour < endtime:
                 pass
             else:
                 print_color("非Mint时间，跳过", 'red')
                 return False
+        else:
+            if endtime <= tm_hour < starttime:
+                print_color("非Mint时间，跳过", 'red')
+                return False
+            else:
+                pass
     return True
 
 
 def getgas():
-    headers = {"Authorization": blocknativeKey}
-    url = 'https://api.blocknative.com/gasprices/blockprices?confidenceLevels=95'
-    res = requests.get(url=url, headers=headers)
+    url = 'https://blocknative-api.herokuapp.com/data'
+    res = requests.get(url=url)
     if res.status_code == 200:
-        estimatedPrices = res.json()['blockPrices'][0]['estimatedPrices'][0]
+        estimatedPrices = res.json()['estimatedPrices'][0]
         maxPriorityFeePerGas = estimatedPrices['maxPriorityFeePerGas']
         maxFeePerGas = estimatedPrices['maxFeePerGas']
         baseFee = estimatedPrices['price']
@@ -188,7 +196,7 @@ def minttx(_account, _privateKey, _inputData, _method, _from_address, _to_addres
             'chainId': chainId,
             'to': _to_address,
             'gas': _gasLimit,
-            'maxFeePerGas': _maxFeePerGas,
+            'maxFeePerGas': int(_maxFeePerGas * 2),
             'maxPriorityFeePerGas': _maxPriorityFeePerGas,
             'nonce': w3.eth.getTransactionCount(_account.address),
             'data': _inputData,
@@ -199,8 +207,14 @@ def minttx(_account, _privateKey, _inputData, _method, _from_address, _to_addres
             if estimateGas > _gasLimit:
                 transaction['gas'] = int(estimateGas * 1.2)
         except Exception as e:
+            if 'max fee per gas less than block base fee' in str(e):
+                _, maxFeePerGas, maxPriorityFeePerGas = getgas()
+                transaction['maxFeePerGas'] = int(maxFeePerGas * 2)
+                transaction['maxPriorityFeePerGas'] = maxPriorityFeePerGas
             if 'allowance' not in str(e):
                 print_color('发送交易失败:' + str(e), 'red')
+                if _to_address in mintadd:
+                    mintadd.remove(_to_address)
                 return
         signed = w3.eth.account.sign_transaction(transaction, _privateKey)
         new_raw = signed.rawTransaction.hex()
@@ -229,18 +243,8 @@ def minttx(_account, _privateKey, _inputData, _method, _from_address, _to_addres
         return
 
 
-async def txn_handler(txn, unsubscribe):
-    to_address = txn['to']
-    from_address = txn['from']
+def txn_handler(to_address, from_address, inputData, value, gasLimit, tx_maxFeePerGas, tx_maxPriorityFeePerGas, pendingBlockNumber):
     to_address = w3.toChecksumAddress(to_address)
-    inputData = txn['input']
-    value = int(txn['value'])
-    gasLimit = int(txn['gas'])
-    tx_maxFeePerGas, tx_maxPriorityFeePerGas = 0, 0
-    if 'maxFeePerGas' in txn:
-        tx_maxFeePerGas = int(txn['maxFeePerGas'])
-        tx_maxPriorityFeePerGas = int(txn['maxPriorityFeePerGas'])
-    pendingBlockNumber = int(txn['pendingBlockNumber'])
     print_color(from_address + "监控到新交易", 'yellow')
     if not isMintTime(from_address):
         return
@@ -269,22 +273,106 @@ async def txn_handler(txn, unsubscribe):
         threading.Thread(target=minttx, args=(accounts[index], privateKeys[index], inputData, method, from_address, to_address, maxFeePerGas, maxPriorityFeePerGas, value, gasLimit)).start()
 
 
-def main():
-    while True:
+async def blocknative():
+    async for websocket in websockets.connect('wss://api.blocknative.com/v0'):
         try:
-            stream = Stream(blocknativeKey)
-            print_color(str(len(accounts)) + '个地址开始监控', 'blue')
-            print_color('开始监控', 'blue')
+            initialize = {
+                "categoryCode": "initialize",
+                "eventCode": "checkDappId",
+                "dappId": blocknativeKey,
+                "timeStamp": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+                "version": "1",
+                "blockchain": {
+                    "system": "ethereum",
+                    "network": "main"
+                }
+            }
+            await websocket.send(json.dumps(initialize))
             for _follow in follows:
-                filters = [{
-                    "status": "pending",
-                    "from": _follow
-                }]
-                stream.subscribe_address(_follow, txn_handler, filters)
-            stream.connect()
-        except Exception as e:
-            print_color(str(e), 'red')
-            time.sleep(10)
+                configs = {
+                    "categoryCode": "configs",
+                    "eventCode": "put",
+                    "config": {
+                        "scope": _follow,
+                        "filters": [
+                            {
+                                "from": _follow,
+                                "status": "pending"
+                            }
+                        ],
+                        "watchAddress": True
+                    },
+                    "dappId": blocknativeKey,
+                    "timeStamp": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
+                    "version": "1",
+                    "blockchain": {
+                        "system": "ethereum",
+                        "network": "main"
+                    }
+                }
+                await websocket.send(json.dumps(configs))
+            async for message in websocket:
+                json_data = json.loads(message)
+                if json_data['status'] == 'ok' and 'event' in json_data:
+                    if json_data['event']['categoryCode'] == 'initialize':
+                        print_color('初始化成功', 'blue')
+                    elif json_data['event']['categoryCode'] == 'configs':
+                        print_color(f"监控{json_data['event']['config']['scope']}地址成功", 'blue')
+                    elif json_data['event']['categoryCode'] == 'activeAddress':
+                        txn = json_data['event']['transaction']
+                        to_address = txn['to']
+                        from_address = txn['from']
+                        inputData = txn['input']
+                        gasLimit = int(txn['gas'])
+                        value = int(txn['value'])
+                        if 'maxFeePerGas' in txn:
+                            tx_maxFeePerGas = int(txn['maxFeePerGas'])
+                            tx_maxPriorityFeePerGas = int(txn['maxPriorityFeePerGas'])
+                        else:
+                            tx_maxFeePerGas, tx_maxPriorityFeePerGas = 0, 0
+                        pendingBlockNumber = int(txn['pendingBlockNumber'])
+                        threading.Thread(target=txn_handler, args=(to_address, from_address, inputData, value, gasLimit, tx_maxFeePerGas, tx_maxPriorityFeePerGas, pendingBlockNumber)).start()
+                    else:
+                        print_color(message, 'blue')
+        except websockets.ConnectionClosed:
+            continue
+
+
+async def alchemy():
+    async for websocket in websockets.connect(f'wss://eth-mainnet.alchemyapi.io/v2/{alchemyKey}'):
+        try:
+            json_data = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": []
+            }
+            for _follow in follows:
+                json_data['params'] = ["alchemy_filteredNewFullPendingTransactions", {"address": _follow}]
+                await websocket.send(json.dumps(json_data))
+                result = await websocket.recv()
+                if "result" in result:
+                    print_color(f"监控{_follow}地址成功", 'blue')
+            async for message in websocket:
+                json_data = json.loads(message)
+                if 'params' in json_data:
+                    txn = json_data['params']['result']
+                    to_address = txn['to']
+                    from_address = txn['from']
+                    if from_address.lower() not in follows:
+                        return
+                    inputData = txn['input']
+                    gasLimit = int(txn['gas'], 16)
+                    value = int(txn['value'], 16)
+                    if 'maxFeePerGas' in txn:
+                        tx_maxFeePerGas = int(txn['maxFeePerGas'], 16)
+                        tx_maxPriorityFeePerGas = int(txn['maxPriorityFeePerGas'], 16)
+                    else:
+                        tx_maxFeePerGas, tx_maxPriorityFeePerGas = 0, 0
+                    pendingBlockNumber = w3.eth.get_block_number()
+                    threading.Thread(target=txn_handler, args=(to_address, from_address, inputData, value, gasLimit, tx_maxFeePerGas, tx_maxPriorityFeePerGas, pendingBlockNumber)).start()
+        except websockets.ConnectionClosed:
+            continue
 
 
 if __name__ == '__main__':
@@ -307,8 +395,10 @@ if __name__ == '__main__':
         blacklist = config['blacklist']
         maxValue = config['maxValue']
         blocknativeKey = config['blocknativeKey']
+        alchemyKey = config['alchemyKey']
         barkKey = config['barkKey']
         follows = config['follow']
+        follows = dict((k.lower(), v) for k, v in follows.items())
         nameabi = {
             'inputs': [],
             'name': 'name',
@@ -334,7 +424,12 @@ if __name__ == '__main__':
             '0x23b872dd': {'method': 'transferFrom', 'isMint': False},
             '0xa8a41c70': {'method': 'cancelOrder_', 'isMint': False}
         }
-        main()
+        if len(blocknativeKey) >= 20:
+            asyncio.run(blocknative())
+        elif len(alchemyKey) >= 20:
+            asyncio.run(alchemy())
+        else:
+            print_color('blocknativeKey和alchemyKey必须提供一个', 'red')
     except Exception as e:
         print_color(str(e), 'red')
         time.sleep(10)
